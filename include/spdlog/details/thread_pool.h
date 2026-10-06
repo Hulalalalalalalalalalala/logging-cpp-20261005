@@ -8,8 +8,12 @@
 #include <spdlog/details/os.h>
 
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -27,6 +31,9 @@ enum class async_msg_type { log, flush, terminate };
 struct async_msg : log_msg_buffer {
     async_msg_type msg_type{async_msg_type::log};
     async_logger_ptr worker_ptr;
+    // position of this message in the thread pool's total enqueue order.
+    // Assigned by thread_pool::post_async_msg_() (0 means not yet assigned).
+    std::uint64_t seq{0};
 
     async_msg() = default;
     ~async_msg() = default;
@@ -39,12 +46,14 @@ struct async_msg : log_msg_buffer {
     async_msg(async_msg &&other)
         : log_msg_buffer(std::move(other)),
           msg_type(other.msg_type),
-          worker_ptr(std::move(other.worker_ptr)) {}
+          worker_ptr(std::move(other.worker_ptr)),
+          seq(other.seq) {}
 
     async_msg &operator=(async_msg &&other) {
         *static_cast<log_msg_buffer *>(this) = std::move(other);
         msg_type = other.msg_type;
         worker_ptr = std::move(other.worker_ptr);
+        seq = other.seq;
         return *this;
     }
 #else  // (_MSC_VER) && _MSC_VER <= 1800
@@ -100,8 +109,30 @@ private:
 
     std::vector<std::thread> threads_;
 
+    // Serializes sequence-number assignment with queue insertion, so that
+    // sequence order always matches the order of the items in the queue.
+    std::mutex enqueue_mutex_;
+    std::uint64_t next_seq_ = 1;
+
+    // Tracks which posted messages have been fully processed, in sequence
+    // order. Allows a flush request to wait until every message enqueued
+    // ahead of it has completed processing, even with multiple worker
+    // threads. Messages dropped by an overflow policy are accounted for at
+    // post time, so they never block a pending flush.
+    std::mutex completion_mutex_;
+    std::condition_variable completion_cv_;
+    std::uint64_t completed_through_ = 0;  // every seq <= this is complete
+    std::set<std::uint64_t> completed_ahead_;  // completed seqs past the watermark
+
     void post_async_msg_(async_msg &&new_msg, async_overflow_policy overflow_policy);
     void worker_loop_();
+
+    // mark the message with the given seq as fully processed
+    void mark_seq_complete_(std::uint64_t seq);
+
+    // wait until every message with a seq lower than the given one has been
+    // fully processed
+    void wait_seq_complete_(std::uint64_t seq);
 
     // process next message in the queue
     // return true if this thread should still be active (while no terminate msg

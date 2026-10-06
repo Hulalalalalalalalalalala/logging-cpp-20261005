@@ -3,7 +3,45 @@
 #include "spdlog/sinks/basic_file_sink.h"
 #include "test_sink.h"
 
+#include <algorithm>
+
 #define TEST_FILENAME "test_logs/async_test.log"
+
+namespace {
+// sink that records the cross-thread order of log/flush events
+class event_order_sink final : public spdlog::sinks::sink {
+public:
+    void log(const spdlog::details::log_msg &) override {
+        // slow down so that several worker threads process messages concurrently
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::lock_guard<std::mutex> lock(mutex_);
+        events_.push_back('l');
+    }
+
+    void flush() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        events_.push_back('f');
+    }
+
+    void set_pattern(const std::string &) override {}
+    void set_formatter(std::unique_ptr<spdlog::formatter>) override {}
+
+    std::vector<char> events() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return events_;
+    }
+
+private:
+    std::mutex mutex_;
+    std::vector<char> events_;
+};
+
+// count the log events recorded before the first flush event
+size_t logs_before_first_flush(const std::vector<char> &events) {
+    auto first_flush = std::find(events.begin(), events.end(), 'f');
+    return static_cast<size_t>(std::count(events.begin(), first_flush, 'l'));
+}
+}  // namespace
 
 TEST_CASE("async zero queue size", "[async]") {
     REQUIRE_THROWS_AS(spdlog::details::thread_pool(0, 1), spdlog::spdlog_ex);
@@ -204,3 +242,144 @@ TEST_CASE("bad_tp", "[async]") {
     REQUIRE(test_sink->msg_counter() == 0);
 }
 #endif  // SPDLOG_NO_EXCEPTIONS
+
+TEST_CASE("flush not lost when queue congested (overrun_oldest)", "[async]") {
+    auto test_sink = std::make_shared<spdlog::sinks::test_sink_mt>();
+    test_sink->set_delay(std::chrono::milliseconds(1));
+    size_t queue_size = 4;
+    size_t messages = 128;
+
+    auto tp = std::make_shared<spdlog::details::thread_pool>(queue_size, 1);
+    auto logger = std::make_shared<spdlog::async_logger>(
+        "as", test_sink, tp, spdlog::async_overflow_policy::overrun_oldest);
+    for (size_t i = 0; i < messages; i++) {
+        logger->info("before flush");
+    }
+    // must be accepted even though the queue is congested and the policy is
+    // non-blocking
+    logger->flush();
+    // must not overrun the accepted flush request
+    for (size_t i = 0; i < messages; i++) {
+        logger->info("after flush");
+    }
+    tp.reset();
+
+    REQUIRE(test_sink->flush_counter() == 1);
+}
+
+TEST_CASE("flush not lost when queue congested (discard_new)", "[async]") {
+    auto test_sink = std::make_shared<spdlog::sinks::test_sink_mt>();
+    test_sink->set_delay(std::chrono::milliseconds(1));
+    size_t queue_size = 4;
+    size_t messages = 128;
+
+    auto tp = std::make_shared<spdlog::details::thread_pool>(queue_size, 1);
+    auto logger = std::make_shared<spdlog::async_logger>(
+        "as", test_sink, tp, spdlog::async_overflow_policy::discard_new);
+    for (size_t i = 0; i < messages; i++) {
+        logger->info("before flush");
+    }
+    logger->flush();
+    tp.reset();
+
+    REQUIRE(test_sink->flush_counter() == 1);
+    REQUIRE(test_sink->msg_counter() < messages);
+}
+
+TEST_CASE("overrun_oldest never overruns flush requests", "[async]") {
+    auto test_sink = std::make_shared<spdlog::sinks::test_sink_mt>();
+    test_sink->set_delay(std::chrono::milliseconds(250));
+    size_t queue_size = 2;
+    size_t overrun_counter = 0;
+    size_t discard_counter = 0;
+    {
+        auto tp = std::make_shared<spdlog::details::thread_pool>(queue_size, 1);
+        auto logger = std::make_shared<spdlog::async_logger>(
+            "as", test_sink, tp, spdlog::async_overflow_policy::overrun_oldest);
+
+        // occupy the single worker for a while
+        logger->info("slow message");
+        // fill the whole queue with flush requests
+        logger->flush();
+        logger->flush();
+        // the queue is full and contains only flush requests: this log must
+        // be discarded (counted as discard, not overrun)
+        logger->info("must be discarded");
+
+        overrun_counter = tp->overrun_counter();
+        discard_counter = tp->discard_counter();
+    }
+    REQUIRE(overrun_counter == 0);
+    REQUIRE(discard_counter == 1);
+    REQUIRE(test_sink->flush_counter() == 2);
+}
+
+TEST_CASE("flush waits for prior messages with multiple workers", "[async]") {
+    auto sink = std::make_shared<event_order_sink>();
+    size_t messages = 64;
+    {
+        auto tp = std::make_shared<spdlog::details::thread_pool>(128, 4);
+        auto logger = std::make_shared<spdlog::async_logger>(
+            "as", sink, tp, spdlog::async_overflow_policy::block);
+        for (size_t i = 0; i < messages; i++) {
+            logger->info("message #{}", i);
+        }
+        logger->flush();
+        // messages posted after the flush request are not required to be
+        // processed before it
+        for (size_t i = 0; i < messages; i++) {
+            logger->info("trailing #{}", i);
+        }
+    }
+
+    auto events = sink->events();
+    auto first_flush = std::find(events.begin(), events.end(), 'f');
+    REQUIRE(first_flush != events.end());
+    // every message enqueued before the flush must have been fully processed
+    // before the flush started (trailing messages may also precede it)
+    REQUIRE(logs_before_first_flush(events) >= messages);
+}
+
+TEST_CASE("flush waits for other loggers sharing the pool and sink", "[async]") {
+    auto sink = std::make_shared<event_order_sink>();
+    size_t messages = 32;
+    {
+        auto tp = std::make_shared<spdlog::details::thread_pool>(128, 4);
+        auto logger_a = std::make_shared<spdlog::async_logger>(
+            "a", sink, tp, spdlog::async_overflow_policy::block);
+        auto logger_b = std::make_shared<spdlog::async_logger>(
+            "b", sink, tp, spdlog::async_overflow_policy::block);
+        for (size_t i = 0; i < messages; i++) {
+            logger_a->info("a #{}", i);
+            logger_b->info("b #{}", i);
+        }
+        // the flush only targets logger_a's sinks, but must also wait for
+        // logger_b's messages that were enqueued ahead of it
+        logger_a->flush();
+    }
+    auto events = sink->events();
+    auto first_flush = std::find(events.begin(), events.end(), 'f');
+    REQUIRE(first_flush != events.end());
+    REQUIRE(logs_before_first_flush(events) >= 2 * messages);
+}
+
+TEST_CASE("async flush completes before thread pool release", "[async]") {
+    prepare_logdir();
+    size_t messages = 512;
+    spdlog::filename_t filename = SPDLOG_FILENAME_T(TEST_FILENAME);
+    // keep the sink alive past the pool release: the file content must be
+    // readable without relying on the sink's destructor
+    auto file_sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(filename, true);
+    {
+        auto tp = std::make_shared<spdlog::details::thread_pool>(128, 2);
+        {
+            auto logger = std::make_shared<spdlog::async_logger>("as", file_sink, tp);
+            for (size_t i = 0; i < messages; i++) {
+                logger->info("Hello message #{}", i);
+            }
+            logger->flush();
+        }  // release the logger first
+    }  // then release the pool: all accepted flushes must be complete by now
+
+    require_message_count(TEST_FILENAME, messages);
+}

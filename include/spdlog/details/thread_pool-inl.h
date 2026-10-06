@@ -66,7 +66,12 @@ void SPDLOG_INLINE thread_pool::post_log(async_logger_ptr &&worker_ptr,
 
 void SPDLOG_INLINE thread_pool::post_flush(async_logger_ptr &&worker_ptr,
                                            async_overflow_policy overflow_policy) {
-    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush), overflow_policy);
+    // An explicit flush request must always be accepted: wait for room if the
+    // queue is full instead of overrunning existing messages or being
+    // discarded, regardless of the logger's own overflow policy.
+    (void)overflow_policy;
+    post_async_msg_(async_msg(std::move(worker_ptr), async_msg_type::flush),
+                    async_overflow_policy::block);
 }
 
 size_t SPDLOG_INLINE thread_pool::overrun_counter() { return q_.overrun_counter(); }
@@ -81,14 +86,49 @@ size_t SPDLOG_INLINE thread_pool::queue_size() { return q_.size(); }
 
 void SPDLOG_INLINE thread_pool::post_async_msg_(async_msg &&new_msg,
                                                 async_overflow_policy overflow_policy) {
+    // Assign the sequence number and enqueue under the same lock, so that
+    // sequence order always matches queue order.
+    std::lock_guard<std::mutex> enqueue_lock(enqueue_mutex_);
+    new_msg.seq = next_seq_++;
     if (overflow_policy == async_overflow_policy::block) {
         q_.enqueue(std::move(new_msg));
     } else if (overflow_policy == async_overflow_policy::overrun_oldest) {
-        q_.enqueue_nowait(std::move(new_msg));
+        // Never overrun flush or terminate requests: only the oldest normal
+        // log message may be dropped. If the full queue holds no normal log
+        // (i.e. it contains only flush requests), the new message is
+        // discarded and counted as such.
+        const std::uint64_t seq = new_msg.seq;
+        const bool pushed = q_.enqueue_nowait_over_oldest_if(
+            std::move(new_msg),
+            [](const async_msg &m) { return m.msg_type == async_msg_type::log; },
+            [this](async_msg &&overrun) { mark_seq_complete_(overrun.seq); });
+        if (!pushed) {
+            mark_seq_complete_(seq);
+        }
     } else {
         assert(overflow_policy == async_overflow_policy::discard_new);
-        q_.enqueue_if_have_room(std::move(new_msg));
+        const std::uint64_t seq = new_msg.seq;
+        if (!q_.enqueue_if_have_room(std::move(new_msg))) {
+            mark_seq_complete_(seq);
+        }
     }
+}
+
+void SPDLOG_INLINE thread_pool::mark_seq_complete_(std::uint64_t seq) {
+    {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        completed_ahead_.insert(seq);
+        while (!completed_ahead_.empty() && *completed_ahead_.begin() == completed_through_ + 1) {
+            completed_ahead_.erase(completed_ahead_.begin());
+            ++completed_through_;
+        }
+    }
+    completion_cv_.notify_all();
+}
+
+void SPDLOG_INLINE thread_pool::wait_seq_complete_(std::uint64_t seq) {
+    std::unique_lock<std::mutex> lock(completion_mutex_);
+    completion_cv_.wait(lock, [this, seq] { return completed_through_ + 1 >= seq; });
 }
 
 void SPDLOG_INLINE thread_pool::worker_loop_() {
@@ -101,18 +141,26 @@ void SPDLOG_INLINE thread_pool::worker_loop_() {
 bool SPDLOG_INLINE thread_pool::process_next_msg_() {
     async_msg incoming_async_msg;
     q_.dequeue(incoming_async_msg);
+    const std::uint64_t seq = incoming_async_msg.seq;
 
     switch (incoming_async_msg.msg_type) {
         case async_msg_type::log: {
             incoming_async_msg.worker_ptr->backend_sink_it_(incoming_async_msg);
+            mark_seq_complete_(seq);
             return true;
         }
         case async_msg_type::flush: {
+            // Before flushing, wait until every message enqueued ahead of
+            // this request (and not dropped by an overflow policy) has been
+            // fully processed by its worker thread.
+            wait_seq_complete_(seq);
             incoming_async_msg.worker_ptr->backend_flush_();
+            mark_seq_complete_(seq);
             return true;
         }
 
         case async_msg_type::terminate: {
+            mark_seq_complete_(seq);
             return false;
         }
 

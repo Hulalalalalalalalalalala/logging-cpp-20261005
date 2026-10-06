@@ -46,7 +46,7 @@ public:
         push_cv_.notify_one();
     }
 
-    void enqueue_if_have_room(T &&item) {
+    bool enqueue_if_have_room(T &&item) {
         bool pushed = false;
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -61,6 +61,7 @@ public:
         } else {
             ++discard_counter_;
         }
+        return pushed;
     }
 
     // dequeue with a timeout.
@@ -108,7 +109,7 @@ public:
         push_cv_.notify_one();
     }
 
-    void enqueue_if_have_room(T &&item) {
+    bool enqueue_if_have_room(T &&item) {
         bool pushed = false;
         std::unique_lock<std::mutex> lock(queue_mutex_);
         if (!q_.full()) {
@@ -121,6 +122,7 @@ public:
         } else {
             ++discard_counter_;
         }
+        return pushed;
     }
 
     // dequeue with a timeout.
@@ -146,6 +148,41 @@ public:
     }
 
 #endif
+
+    // Enqueue immediately. If the queue is full, remove the oldest item for
+    // which should_overrun(item) returns true (counted as an overrun) and hand
+    // it to on_overrun, keeping the relative order of all other items. If no
+    // item may be overrun, the new item is discarded and the discard counter
+    // is incremented instead.
+    // Returns true if the item was enqueued, false if it was discarded.
+    template <typename ShouldOverrun, typename OnOverrun>
+    bool enqueue_nowait_over_oldest_if(T &&item,
+                                       ShouldOverrun should_overrun,
+                                       OnOverrun on_overrun) {
+        bool pushed = false;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            if (!q_.full()) {
+                q_.push_back(std::move(item));
+                pushed = true;
+            } else {
+                T removed;
+                if (q_.pop_oldest_if(removed, should_overrun)) {
+                    on_overrun(std::move(removed));
+                    q_.push_back(std::move(item));
+                    pushed = true;
+                }
+            }
+            // notify while holding the lock: safe on all platforms (mingw
+            // included) and the queue is never empty after a push
+            if (pushed) {
+                push_cv_.notify_one();
+            } else {
+                ++discard_counter_;
+            }
+        }
+        return pushed;
+    }
 
     size_t overrun_counter() {
         std::lock_guard<std::mutex> lock(queue_mutex_);

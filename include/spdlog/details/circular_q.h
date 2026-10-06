@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cassert>
+#include <utility>
 #include <vector>
 
 #include "spdlog/common.h"
@@ -81,6 +82,31 @@ public:
     // Pop item from front.
     // If there are no elements in the container, the behavior is undefined.
     void pop_front() { head_ = (head_ + 1) % max_items_; }
+
+    // Remove the oldest item for which pred(item) returns true, moving it
+    // into `removed`. The relative order of all remaining items is preserved.
+    // Returns true if an item was removed (counted as an overrun).
+    template <typename Pred>
+    bool pop_oldest_if(T &removed, Pred pred) {
+        const size_t n = size();
+        for (size_t i = 0; i < n; ++i) {
+            size_t idx = (head_ + i) % max_items_;
+            if (pred(v_[idx])) {
+                removed = std::move(v_[idx]);
+                // shift the preceding items one slot towards the tail to
+                // close the gap, keeping their relative order
+                while (idx != head_) {
+                    const size_t prev = (idx == 0) ? max_items_ - 1 : idx - 1;
+                    v_[idx] = std::move(v_[prev]);
+                    idx = prev;
+                }
+                head_ = (head_ + 1) % max_items_;
+                ++overrun_counter_;
+                return true;
+            }
+        }
+        return false;
+    }
 
     bool empty() const { return tail_ == head_; }
 
