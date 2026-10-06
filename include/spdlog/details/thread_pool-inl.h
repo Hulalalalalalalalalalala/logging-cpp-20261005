@@ -81,10 +81,20 @@ size_t SPDLOG_INLINE thread_pool::queue_size() { return q_.size(); }
 
 void SPDLOG_INLINE thread_pool::post_async_msg_(async_msg &&new_msg,
                                                 async_overflow_policy overflow_policy) {
-    if (overflow_policy == async_overflow_policy::block) {
+    // Flush (and terminate) requests must always be accepted once submitted:
+    // wait for room in the queue instead of evicting or discarding queued
+    // messages, whatever overflow policy regular log messages use. The queue
+    // capacity is never exceeded while waiting.
+    if (new_msg.msg_type != async_msg_type::log ||
+        overflow_policy == async_overflow_policy::block) {
         q_.enqueue(std::move(new_msg));
     } else if (overflow_policy == async_overflow_policy::overrun_oldest) {
-        q_.enqueue_nowait(std::move(new_msg));
+        // Overrun the oldest regular log message only: queued flush requests
+        // are never evicted and keep their relative order. If the queue holds
+        // no regular log message, the new message is discarded instead.
+        q_.enqueue_nowait(std::move(new_msg), [](const async_msg &queued_msg) {
+            return queued_msg.msg_type == async_msg_type::log;
+        });
     } else {
         assert(overflow_policy == async_overflow_policy::discard_new);
         q_.enqueue_if_have_room(std::move(new_msg));
@@ -96,11 +106,47 @@ void SPDLOG_INLINE thread_pool::worker_loop_() {
     }
 }
 
+void SPDLOG_INLINE thread_pool::mark_completed_(size_t item_index) {
+    bool advanced = false;
+    {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        if (item_index == completed_watermark_) {
+            ++completed_watermark_;
+            while (completed_ahead_.erase(completed_watermark_) != 0) {
+                ++completed_watermark_;
+            }
+            advanced = true;
+        } else {
+            completed_ahead_.insert(item_index);
+        }
+    }
+    if (advanced) {
+        completion_cv_.notify_all();
+    }
+}
+
+void SPDLOG_INLINE thread_pool::wait_for_predecessors_(size_t item_index) {
+    std::unique_lock<std::mutex> lock(completion_mutex_);
+    // completed_watermark_ is the lowest not-yet-completed dequeue index, so
+    // every item ahead of item_index is done once it reaches item_index.
+    completion_cv_.wait(lock, [this, item_index] { return item_index <= completed_watermark_; });
+}
+
 // process next message in the queue
 // returns true if this thread should still be active (while no terminated msg was received)
 bool SPDLOG_INLINE thread_pool::process_next_msg_() {
     async_msg incoming_async_msg;
-    q_.dequeue(incoming_async_msg);
+    size_t item_index = 0;
+    q_.dequeue(incoming_async_msg, item_index);
+
+    // Mark the item as fully processed when leaving this scope, whatever
+    // happens, so that a queued flush request never waits on an item that
+    // otherwise would not be reported as completed.
+    struct completion_guard {
+        thread_pool &pool;
+        size_t index;
+        ~completion_guard() { pool.mark_completed_(index); }
+    } guard{*this, item_index};
 
     switch (incoming_async_msg.msg_type) {
         case async_msg_type::log: {
@@ -108,6 +154,11 @@ bool SPDLOG_INLINE thread_pool::process_next_msg_() {
             return true;
         }
         case async_msg_type::flush: {
+            // A flush request must observe every message queued ahead of it
+            // (and not dropped by the overflow policy) as fully processed
+            // before it starts flushing any sink, even when several worker
+            // threads share this pool.
+            wait_for_predecessors_(item_index);
             incoming_async_msg.worker_ptr->backend_flush_();
             return true;
         }

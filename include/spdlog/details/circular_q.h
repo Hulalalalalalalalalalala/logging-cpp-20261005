@@ -82,6 +82,28 @@ public:
     // If there are no elements in the container, the behavior is undefined.
     void pop_front() { head_ = (head_ + 1) % max_items_; }
 
+    // Remove the oldest item matching the given predicate, keeping the
+    // relative order of all remaining items. The removal is counted as an
+    // overrun.
+    // Returns true if an item was removed.
+    template <typename Pred>
+    bool remove_first_matching(Pred pred) {
+        const auto n = size();
+        for (size_t i = 0; i < n; ++i) {
+            if (pred(v_[(head_ + i) % max_items_])) {
+                // shift the items that follow one slot towards the head
+                for (size_t j = i; j + 1 < n; ++j) {
+                    v_[(head_ + j) % max_items_] = std::move(v_[(head_ + j + 1) % max_items_]);
+                }
+                v_[(head_ + n - 1) % max_items_] = T{};
+                tail_ = (tail_ == 0) ? max_items_ - 1 : tail_ - 1;
+                ++overrun_counter_;
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool empty() const { return tail_ == head_; }
 
     bool full() const {

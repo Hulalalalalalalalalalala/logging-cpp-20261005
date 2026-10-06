@@ -8,9 +8,12 @@
 #include <spdlog/details/os.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 SPDLOG_NAMESPACE_BEGIN
@@ -88,6 +91,12 @@ public:
     void post_log(async_logger_ptr &&worker_ptr,
                   const details::log_msg &msg,
                   async_overflow_policy overflow_policy);
+    // Post a flush request for the given logger. The request is always
+    // accepted (waiting for room in the queue if needed, regardless of the
+    // given overflow policy) and is never evicted or merged once queued, so
+    // every accepted request eventually flushes each of the logger's sinks
+    // exactly once. Returning means the request was submitted, not that the
+    // sinks were already flushed.
     void post_flush(async_logger_ptr &&worker_ptr, async_overflow_policy overflow_policy);
     size_t overrun_counter();
     void reset_overrun_counter();
@@ -100,8 +109,25 @@ private:
 
     std::vector<std::thread> threads_;
 
+    // Flush ordering: every dequeued item carries a monotonically increasing
+    // index (see q_type::dequeue). A flush request must not start flushing
+    // any sink before every item dequeued ahead of it has been fully
+    // processed, even when several worker threads share this pool.
+    // completed_watermark_ is the lowest dequeue index not yet completed;
+    // completed_ahead_ holds completed indices at or above the watermark.
+    std::mutex completion_mutex_;
+    std::condition_variable completion_cv_;
+    size_t completed_watermark_{0};
+    std::unordered_set<size_t> completed_ahead_;
+
     void post_async_msg_(async_msg &&new_msg, async_overflow_policy overflow_policy);
     void worker_loop_();
+
+    // mark the item with the given dequeue index as fully processed
+    void mark_completed_(size_t item_index);
+
+    // wait until every item dequeued before the given index was fully processed
+    void wait_for_predecessors_(size_t item_index);
 
     // process next message in the queue
     // return true if this thread should still be active (while no terminate msg
